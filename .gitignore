@@ -1,0 +1,34 @@
+# Study/reference repos (not used by experiments or setup_and_train.sh)
+SpikeGPT/
+SpikingBrain-7B/
+SpikeLM/
+SC-PyTorch/
+
+# Venvs (recreate on the machine with setup_and_train.sh)
+nanochat/.venv/
+nanochat/.venv312/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local env / secrets
+.env
+.env.local
+*.local
+
+# Cache (data/tokenizer live in ~/.cache/nanochat, not in repo)
+.cache/
