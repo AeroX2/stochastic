@@ -10,7 +10,7 @@
 #   --variant=...     (required) baseline | spiking | stochastic | both
 #   --depth=N         model depth (default: 12)
 #   --run=NAME        run name for logging (default: dummy = no wandb)
-#   --skip-setup      skip venv/create and pip install (env already ready)
+#   --skip-setup      skip pip install (use system Python as-is)
 #   --skip-data       skip dataset download and tokenizer training
 #   --num-iterations=N  training steps (default: from nanochat scaling; use e.g. 100 for a short test)
 #   --device-batch-size=N  per-device batch size (default: 32)
@@ -28,8 +28,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NANOCHAT_DIR="$REPO_ROOT/nanochat"
-VENV_DIR="${VENV_DIR:-$NANOCHAT_DIR/.venv}"
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+# Python to use (set during setup or when --skip-setup)
+PYTHON=""
 
 # Defaults
 VARIANT=""
@@ -114,14 +115,13 @@ mkdir -p "$NANOCHAT_BASE_DIR"
 CHECKPOINT_DIR="$NANOCHAT_BASE_DIR/base_checkpoints/d${DEPTH}"
 
 # -----------------------------------------------------------------------------
-# Setup: Python 3.12 venv + PyTorch (CUDA if available) + deps
+# Setup: find Python 3.10–3.12 and install PyTorch + deps (no venv)
 # -----------------------------------------------------------------------------
 if [[ "$SKIP_SETUP" != true ]]; then
   if ! command -v python3.12 &>/dev/null && ! command -v python3 &>/dev/null; then
-    echo "Error: Python 3 not found. Install Python 3.12 (e.g. apt install python3.12-venv python3.12-dev, or pyenv)." >&2
+    echo "Error: Python 3 not found. Install Python 3.12 (e.g. apt install python3.12 python3.12-dev)." >&2
     exit 1
   fi
-  PYTHON=""
   for p in python3.12 python3; do
     if command -v "$p" &>/dev/null; then
       if "$p" -c 'import sys; exit(0 if sys.version_info >= (3,10) and sys.version_info < (3,14) else 1)' 2>/dev/null; then
@@ -136,30 +136,30 @@ if [[ "$SKIP_SETUP" != true ]]; then
   fi
   echo "Using $PYTHON: $($PYTHON --version)"
 
-  mkdir -p "$(dirname "$VENV_DIR")"
-  if [[ ! -d "$VENV_DIR" ]] || [[ ! -f "$VENV_DIR/bin/activate" ]]; then
-    "$PYTHON" -m venv "$VENV_DIR"
-  fi
-  source "$VENV_DIR/bin/activate"
-
   # Prefer CUDA build if nvidia-smi works
   if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
     echo "GPU detected; installing PyTorch with CUDA 12.x ..."
-    python -m pip install -q --upgrade pip
-    python -m pip install -q torch --index-url https://download.pytorch.org/whl/cu124
+    "$PYTHON" -m pip install -q --upgrade pip
+    "$PYTHON" -m pip install -q torch --index-url https://download.pytorch.org/whl/cu124
   else
     echo "No GPU detected; installing PyTorch CPU ..."
-    python -m pip install -q --upgrade pip
-    python -m pip install -q torch
+    "$PYTHON" -m pip install -q --upgrade pip
+    "$PYTHON" -m pip install -q torch
   fi
 
   # nanochat deps (from pyproject.toml, minus torch already installed)
-  python -m pip install -q datasets transformers tiktoken wandb accelerate regex tokenizers zstandard scipy setuptools
-  python -m pip install -q rustbpe
-  echo "Venv ready at $VENV_DIR"
+  "$PYTHON" -m pip install -q datasets transformers tiktoken wandb accelerate regex tokenizers zstandard scipy setuptools
+  "$PYTHON" -m pip install -q rustbpe
+  "$PYTHON" -m pip install -q "kernels>=0.11.7"
+  echo "Setup done (using system Python, no venv)."
 else
-  source "$VENV_DIR/bin/activate"
+  PYTHON="${PYTHON:-python3}"
+  if ! command -v "$PYTHON" &>/dev/null; then
+    PYTHON="python"
+  fi
+  echo "Using $PYTHON (--skip-setup)."
 fi
+export PYTHON
 
 export PYTHONPATH="${REPO_ROOT}:${NANOCHAT_DIR}"
 
@@ -169,8 +169,8 @@ export PYTHONPATH="${REPO_ROOT}:${NANOCHAT_DIR}"
 if [[ "$SKIP_DATA" != true ]]; then
   if [[ ! -f "$NANOCHAT_BASE_DIR/tokenizer/tokenizer.pkl" ]]; then
     echo "Downloading dataset and training tokenizer ..."
-    (cd "$NANOCHAT_DIR" && python -m nanochat.dataset -n 8)
-    (cd "$NANOCHAT_DIR" && PYTHONPATH="${REPO_ROOT}:${NANOCHAT_DIR}" python -m scripts.tok_train --max-chars=2000000000)
+    (cd "$NANOCHAT_DIR" && "$PYTHON" -m nanochat.dataset -n 8)
+    (cd "$NANOCHAT_DIR" && PYTHONPATH="${REPO_ROOT}:${NANOCHAT_DIR}" "$PYTHON" -m scripts.tok_train --max-chars=2000000000)
     echo "Tokenizer saved to $NANOCHAT_BASE_DIR/tokenizer/"
   else
     echo "Tokenizer already present at $NANOCHAT_BASE_DIR/tokenizer/"
@@ -197,14 +197,14 @@ TRAIN_ARGS+=("${EXTRA_ARGS[@]}")
 # -----------------------------------------------------------------------------
 HF_UPLOAD_PID=""
 if [[ -n "$HF_REPO" ]] && [[ "${HF_UPLOAD_INTERVAL:-0}" -gt 0 ]]; then
-  python -m pip install -q huggingface_hub
-  export CHECKPOINT_DIR HF_REPO
+  "$PYTHON" -m pip install -q huggingface_hub
+  export CHECKPOINT_DIR HF_REPO PYTHON
   (
     while true; do
       sleep "$HF_UPLOAD_INTERVAL"
       if [[ -d "$CHECKPOINT_DIR" ]] && compgen -G "${CHECKPOINT_DIR}/model_*.pt" >/dev/null 2>&1; then
         echo "[HF background] Uploading checkpoint to $HF_REPO ..."
-        python -c "
+        "$PYTHON" -c "
 import os
 from huggingface_hub import HfApi
 api = HfApi()
@@ -220,11 +220,11 @@ print('[HF background] Upload done.')
 fi
 
 if [[ "$NPROC_PER_NODE" -gt 1 ]]; then
-  echo "Running: torchrun --nproc_per_node=$NPROC_PER_NODE -m experiments.train ${TRAIN_ARGS[*]}"
-  torchrun --nproc_per_node="$NPROC_PER_NODE" -m experiments.train "${TRAIN_ARGS[@]}"
+  echo "Running: $PYTHON -m torch.distributed.run --nproc_per_node=$NPROC_PER_NODE -m experiments.train ${TRAIN_ARGS[*]}"
+  "$PYTHON" -m torch.distributed.run --nproc_per_node="$NPROC_PER_NODE" -m experiments.train "${TRAIN_ARGS[@]}"
 else
-  echo "Running: python -m experiments.train ${TRAIN_ARGS[*]}"
-  python -m experiments.train "${TRAIN_ARGS[@]}"
+  echo "Running: $PYTHON -m experiments.train ${TRAIN_ARGS[*]}"
+  "$PYTHON" -m experiments.train "${TRAIN_ARGS[@]}"
 fi
 TRAIN_EXIT=$?
 
@@ -242,8 +242,8 @@ if [[ -n "$HF_REPO" ]]; then
     echo "Warning: Checkpoint dir not found ($CHECKPOINT_DIR), skipping HF upload." >&2
   else
     echo "Uploading checkpoint to Hugging Face: $HF_REPO"
-    python -m pip install -q huggingface_hub 2>/dev/null || true
-    HF_REPO="$HF_REPO" CHECKPOINT_DIR="$CHECKPOINT_DIR" python -c "
+    "$PYTHON" -m pip install -q huggingface_hub 2>/dev/null || true
+    HF_REPO="$HF_REPO" CHECKPOINT_DIR="$CHECKPOINT_DIR" "$PYTHON" -c "
 import os
 from huggingface_hub import HfApi
 api = HfApi()
