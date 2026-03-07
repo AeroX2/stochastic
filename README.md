@@ -116,6 +116,11 @@ The script will: create a venv (if needed), install PyTorch (CUDA if `nvidia-smi
 - `--nproc-per-node=N` — use `torchrun` with N GPUs (e.g. `8` for 8× H100)
 - `--save-every=N` — save a checkpoint every N steps (recommended on **interruptible** instances)
 - `--hf-upload-interval=N` — when using `--hf-repo`, upload to HF every N seconds in the background (default 600 = 10 min)
+- `--skip-eval` — skip running evaluation after training (by default the script runs nanochat’s base_eval: CORE metric, BPB on train/val, and samples)
+
+**Test HF upload (no training):** From repo root, set `HF_TOKEN` and run:  
+`python -m experiments.test_hf_upload --repo=USERNAME/stochastic-upload-test`  
+This uploads a minimal fake checkpoint to the given repo so you can confirm token and permissions work.
 
 **Example: 8× H100 on Vast.ai (interruptible), then upload and shut down**
 

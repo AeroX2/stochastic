@@ -18,6 +18,7 @@
 #   --nproc-per-node=N      use torchrun with N GPUs (e.g. 8 for 8x H100); default 1 = single process
 #   --save-every=N          save checkpoint every N steps (for interruptible instances; passed to nanochat)
 #   --hf-upload-interval=N  when using --hf-repo, also upload every N seconds in background (default 600 = 10 min)
+#   --skip-eval             skip running base_eval after training (CORE, BPB, samples)
 #
 # Examples:
 #   ./setup_and_train.sh --variant=baseline
@@ -44,6 +45,7 @@ HF_REPO=""
 NPROC_PER_NODE=1
 SAVE_EVERY=""
 HF_UPLOAD_INTERVAL=600
+SKIP_EVAL=false
 EXTRA_ARGS=()
 
 # Parse script-specific args; pass the rest to training
@@ -93,6 +95,10 @@ while [[ $# -gt 0 ]]; do
       HF_UPLOAD_INTERVAL="${1#--hf-upload-interval=}"
       shift
       ;;
+    --skip-eval)
+      SKIP_EVAL=true
+      shift
+      ;;
     *)
       EXTRA_ARGS+=("$1")
       shift
@@ -102,7 +108,7 @@ done
 
 if [[ -z "$VARIANT" ]]; then
   echo "Usage: $0 --variant=baseline|spiking|stochastic|both [OPTIONS]" >&2
-  echo "  --depth=N  --run=NAME  --skip-setup  --skip-data  --hf-repo=USER/REPO  --nproc-per-node=N  --save-every=N" >&2
+  echo "  --depth=N  --run=NAME  --skip-setup  --skip-data  --hf-repo=USER/REPO  --nproc-per-node=N  --save-every=N  --skip-eval" >&2
   exit 1
 fi
 
@@ -227,6 +233,23 @@ else
   "$PYTHON" -m experiments.train "${TRAIN_ARGS[@]}"
 fi
 TRAIN_EXIT=$?
+
+# -----------------------------------------------------------------------------
+# Eval (CORE, BPB, samples) — same variant and model-tag as training
+# -----------------------------------------------------------------------------
+if [[ "$SKIP_EVAL" != true ]] && [[ "$TRAIN_EXIT" -eq 0 ]]; then
+  EVAL_ARGS=(--model-tag "d${DEPTH}" --device-batch-size="$DEVICE_BATCH_SIZE")
+  if [[ "$NPROC_PER_NODE" -gt 1 ]]; then
+    echo "Running eval: $PYTHON -m torch.distributed.run --nproc_per_node=$NPROC_PER_NODE -m experiments.eval --variant=$VARIANT ${EVAL_ARGS[*]}"
+    "$PYTHON" -m torch.distributed.run --nproc_per_node="$NPROC_PER_NODE" -m experiments.eval --variant="$VARIANT" "${EVAL_ARGS[@]}" || true
+  else
+    echo "Running eval: $PYTHON -m experiments.eval --variant=$VARIANT ${EVAL_ARGS[*]}"
+    "$PYTHON" -m experiments.eval --variant="$VARIANT" "${EVAL_ARGS[@]}" || true
+  fi
+  echo "Eval finished."
+elif [[ "$SKIP_EVAL" == true ]]; then
+  echo "Skipping eval (--skip-eval)."
+fi
 
 # Stop background upload loop
 if [[ -n "$HF_UPLOAD_PID" ]]; then
