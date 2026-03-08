@@ -146,7 +146,7 @@ if [[ "$SKIP_SETUP" != true ]]; then
   if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
     echo "GPU detected; installing PyTorch with CUDA 12.x ..."
     "$PYTHON" -m pip install -q --upgrade pip
-    "$PYTHON" -m pip install -q torch --index-url https://download.pytorch.org/whl/cu124
+    "$PYTHON" -m pip install -q torch --index-url https://download.pytorch.org/whl/cu128
   else
     echo "No GPU detected; installing PyTorch CPU ..."
     "$PYTHON" -m pip install -q --upgrade pip
