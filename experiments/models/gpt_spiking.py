@@ -15,6 +15,7 @@ from nanochat.gpt import (
     has_ve,
     apply_rotary_emb,
     CausalSelfAttention,
+    Block as BaseBlock,
 )
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
@@ -28,9 +29,9 @@ class SpikingMLP(nn.Module):
 
     def __init__(self, config, ternary=False):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.spike_act = SpikingActivation(threshold=0.0, alpha=2.0, ternary=ternary, learnable_scale=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = Linear(config.n_embd, 6 * config.n_embd, bias=False)
+        self.spike_act = SpikingActivation(threshold=0.0, alpha=4.0, ternary=True, learnable_scale=True)
+        self.c_proj = Linear(6 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -65,7 +66,10 @@ class GPTSpiking(GPT):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([SpikingBlock(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList([
+                SpikingBlock(config, i) if (i % 2 == 0) else BaseBlock(config, i)
+                for i in range(config.n_layer)
+            ]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))

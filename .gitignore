@@ -3,6 +3,7 @@ SpikeGPT/
 SpikingBrain-7B/
 SpikeLM/
 SC-PyTorch/
+vastai-0.5.0/
 
 # Venvs (recreate on the machine with setup_and_train.sh)
 nanochat/.venv/
@@ -32,3 +33,6 @@ Thumbs.db
 
 # Cache (data/tokenizer live in ~/.cache/nanochat, not in repo)
 .cache/
+
+vast_logs/
+vast_vastai_key*

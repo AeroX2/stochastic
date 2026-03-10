@@ -2,6 +2,8 @@
 Spiking activation for use in MLP (and optionally elsewhere).
 Single-step LIF-style threshold with surrogate gradient for backprop.
 Inspired by SpikeLM's ElasticBiSpiking and SpikeGPT's LIF; simplified for (B, T, C) without extra time dimension.
+
+Uses a custom torch.autograd.Function; torch.compile can hang on it. If --variant=spiking hangs, use --no-compile.
 """
 
 import torch
@@ -50,9 +52,13 @@ class SpikingActivation(nn.Module):
     Surrogate uses ATan-style smooth gradient. Optional learnable scale for output magnitude (elastic bi-spiking style).
     """
 
-    def __init__(self, threshold=0.0, alpha=2.0, ternary=False, learnable_scale=True):
+    def __init__(self, threshold=0.0, alpha=4.0, ternary=False, learnable_scale=True, dim=None):
         super().__init__()
-        self.threshold = threshold
+        if dim is not None:
+            # Per-channel learnable thresholds; assumes last dimension = dim
+            self.threshold = nn.Parameter(torch.full((dim,), float(threshold)))
+        else:
+            self.threshold = threshold
         self.ternary = ternary
         self.alpha = alpha  # surrogate smoothness (fixed)
         self.scale = nn.Parameter(torch.tensor(1.0)) if learnable_scale else 1.0
@@ -60,5 +66,6 @@ class SpikingActivation(nn.Module):
 
     def forward(self, x):
         spike = _SurrogateSpiking.apply(x, self.threshold, self.alpha, self.ternary)
+        gate = torch.sigmoid(x)
         s = self.scale.clamp(min=0.1) if self.learnable_scale and isinstance(self.scale, torch.Tensor) else self.scale
-        return spike * s
+        return spike * gate * s

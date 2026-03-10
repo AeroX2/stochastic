@@ -18,9 +18,11 @@ class StochasticLinear(nn.Linear):
 
     def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
         super().__init__(in_features, out_features, bias, device, dtype)
+        self.temperature = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, x):
         weight = self.weight.to(dtype=x.dtype)
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
-        x_u = torch.sigmoid(x)  # unipolar [0,1] for SC interpretation
+        temp = self.temperature.clamp(min=0.1)
+        x_u = torch.sigmoid(x * temp)  # unipolar [0,1] for SC interpretation
         return F.linear(x_u, weight, bias)

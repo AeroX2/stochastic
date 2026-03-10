@@ -19,6 +19,7 @@
 #   --save-every=N          save checkpoint every N steps (for interruptible instances; passed to nanochat)
 #   --hf-upload-interval=N  when using --hf-repo, also upload every N seconds in background (default 600 = 10 min)
 #   --skip-eval             skip running base_eval after training (CORE, BPB, samples)
+#   --no-compile            disable torch.compile (if spiking variant hangs, add this)
 #
 # Examples:
 #   ./setup_and_train.sh --variant=baseline
@@ -145,11 +146,9 @@ if [[ "$SKIP_SETUP" != true ]]; then
   # Prefer CUDA build if nvidia-smi works
   if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
     echo "GPU detected; installing PyTorch with CUDA 12.x ..."
-    "$PYTHON" -m pip install -q --upgrade pip
     "$PYTHON" -m pip install -q torch --index-url https://download.pytorch.org/whl/cu128
   else
     echo "No GPU detected; installing PyTorch CPU ..."
-    "$PYTHON" -m pip install -q --upgrade pip
     "$PYTHON" -m pip install -q torch
   fi
 
