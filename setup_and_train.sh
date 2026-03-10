@@ -43,7 +43,7 @@ SKIP_DATA=false
 NUM_ITERATIONS=""
 DEVICE_BATCH_SIZE=32
 HF_REPO=""
-NPROC_PER_NODE=1
+NPROC_PER_NODE=0   # 0 = auto-detect from available GPUs
 SAVE_EVERY=""
 HF_UPLOAD_INTERVAL=600
 SKIP_EVAL=false
@@ -167,6 +167,20 @@ fi
 export PYTHON
 
 export PYTHONPATH="${REPO_ROOT}:${NANOCHAT_DIR}"
+
+# Auto-detect GPU count if NPROC_PER_NODE wasn't explicitly set.
+if [[ "$NPROC_PER_NODE" -le 0 ]]; then
+  if command -v nvidia-smi &>/dev/null; then
+    DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$DETECTED_GPUS" =~ ^[0-9]+$ && "$DETECTED_GPUS" -gt 0 ]]; then
+      NPROC_PER_NODE="$DETECTED_GPUS"
+    else
+      NPROC_PER_NODE=1
+    fi
+  else
+    NPROC_PER_NODE=1
+  fi
+fi
 
 # -----------------------------------------------------------------------------
 # Data + tokenizer (one-time)

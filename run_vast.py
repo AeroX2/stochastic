@@ -94,9 +94,11 @@ def find_offer_id(vast: VastClient) -> int:
   return offer_id
 
 
-def create_instance(offer_id: int, vast: VastClient) -> int:
+def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int]:
   """Create an instance from the given offer using the VastAI SDK and
   infer its id by diffing `show_instances` before/after.
+
+  Returns (instance_id, num_gpus).
 
   This avoids depending on the exact JSON shape / return value of
   `create_instance`, which differs across Vast.ai versions.
@@ -183,7 +185,7 @@ def create_instance(offer_id: int, vast: VastClient) -> int:
           continue
         if inst_id not in prev_ids:
           print(f"Instance created with id: {inst_id}")
-          return inst_id
+          return inst_id, num_gpus
 
     print("  New instance not visible yet; sleeping 10s...")
     time.sleep(10)
@@ -191,8 +193,11 @@ def create_instance(offer_id: int, vast: VastClient) -> int:
   raise SystemExit("Timed out waiting for new instance to appear in show_instances after create_instance.")
 
 
-def find_or_create_instance(vast: VastClient) -> int:
-  """Reuse an existing instance if available, otherwise create a new one."""
+def find_or_create_instance(vast: VastClient) -> tuple[int, int]:
+  """Reuse an existing instance if available, otherwise create a new one.
+
+  Returns (instance_id, num_gpus).
+  """
   print("Checking for existing Vast instances...")
   try:
     existing = vast.show_instances()
@@ -210,8 +215,12 @@ def find_or_create_instance(vast: VastClient) -> int:
     running = [row for row in existing if isinstance(row, dict) and is_running(row)]
     chosen = (running or existing)[0]
     inst_id = int(chosen["id"])
-    print(f"Reusing existing instance id: {inst_id}")
-    return inst_id
+    try:
+      num_gpus = int(chosen.get("num_gpus", 1))
+    except Exception:
+      num_gpus = 1
+    print(f"Reusing existing instance id: {inst_id} with num_gpus={num_gpus}")
+    return inst_id, num_gpus
 
   # No existing instance; go through the offer → create flow.
   offer_id = find_offer_id(vast)
@@ -345,16 +354,16 @@ cd stochastic
 chmod +x setup_and_train.sh
 
 echo "Remote: running baseline variant..."
-./setup_and_train.sh --variant=baseline   --nproc-per-node=8 --hf-repo={HF_REPO_BASELINE} --save-every=500
+./setup_and_train.sh --variant=baseline   --hf-repo={HF_REPO_BASELINE} --save-every=500
 
 echo "Remote: running spiking variant..."
-./setup_and_train.sh --variant=spiking    --nproc-per-node=8 --hf-repo={HF_REPO_SPIKING} --save-every=500
+./setup_and_train.sh --variant=spiking    --hf-repo={HF_REPO_SPIKING} --save-every=500
 
 echo "Remote: running stochastic variant..."
-./setup_and_train.sh --variant=stochastic --nproc-per-node=8 --hf-repo={HF_REPO_STOCHASTIC} --save-every=500
+./setup_and_train.sh --variant=stochastic --hf-repo={HF_REPO_STOCHASTIC} --save-every=500
 
 echo "Remote: running both variant..."
-./setup_and_train.sh --variant=both       --nproc-per-node=8 --hf-repo={HF_REPO_BOTH} --save-every=500
+./setup_and_train.sh --variant=both       --hf-repo={HF_REPO_BOTH} --save-every=500
 
 echo "Remote: all variants completed successfully."
 """
@@ -422,25 +431,73 @@ def destroy_instance(instance_id: int, vast: VastClient) -> None:
     print(f"Warning: failed to destroy instance {instance_id} via SDK: {e}", file=sys.stderr)
 
 
+def _prompt_destroy_with_timeout(instance_id: int, timeout_seconds: int = 300) -> bool:
+  """Ask whether to destroy the instance, with a timeout.
+
+  Returns True if we should destroy, False otherwise. If there is no
+  input within `timeout_seconds`, defaults to destroying the instance.
+  """
+  print(
+    f"\nInstance {instance_id} is still running.\n"
+    f"Destroy it now? [Y/n] (auto-destroy in {timeout_seconds // 60} minutes if no input)...",
+    end=" ",
+    flush=True,
+  )
+
+  # Windows: use msvcrt to implement a simple timed input loop.
+  if os.name == "nt":
+    import msvcrt  # type: ignore[import]
+
+    line = ""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+      if msvcrt.kbhit():
+        ch = msvcrt.getwche()
+        if ch in ("\r", "\n"):
+          break
+        # Handle backspace
+        if ch == "\b":
+          if line:
+            line = line[:-1]
+          continue
+        line += ch
+      else:
+        time.sleep(0.1)
+
+    answer = line.strip().lower()
+    if not answer:
+      print("\nNo input received; defaulting to destroy.")
+      return True
+    return answer.startswith("y")
+
+  # POSIX fallback: best-effort blocking input (no real timeout)
+  try:
+    answer = input()
+  except EOFError:
+    return True
+  answer = answer.strip().lower()
+  if not answer:
+    return True
+  return answer.startswith("y")
+
+
 def main() -> None:
   vast_api_key = _require_env("VAST_API_KEY")
   hf_token = _require_env("HF_TOKEN")
   vast = _get_vast_client(vast_api_key)
 
   instance_id: Optional[int] = None
-  success = False
   try:
-    instance_id = find_or_create_instance(vast)
+    instance_id, _ = find_or_create_instance(vast)
     ssh_info = wait_for_ssh_details(instance_id, vast)
     logs_dir = pathlib.Path("vast_logs")
     run_remote_training(ssh_info, hf_token, logs_dir)
-    success = True
   finally:
-    # Only auto-destroy the instance if training completed successfully.
-    # On errors (SSH/connectivity, script failures), leave the instance
-    # running so it can be debugged or reused manually.
-    if instance_id is not None and success:
-      destroy_instance(instance_id, vast)
+    if instance_id is not None:
+      if _prompt_destroy_with_timeout(instance_id):
+        destroy_instance(instance_id, vast)
+      else:
+        print(f"Leaving instance {instance_id} running.")
 
 
 if __name__ == "__main__":
