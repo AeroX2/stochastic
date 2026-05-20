@@ -548,7 +548,18 @@ echo "Remote: __ITER_RUN_DONE__"
         key_filename=ssh_info.get("key_filename"),
         look_for_keys=False,
         timeout=30,
+        # Send TCP keep-alive at the OS layer so idle NAT/proxy timeouts don't
+        # silently kill the connection. Windows was emitting winsock 10054
+        # within 1-2 minutes when tail was idle waiting for new lines.
+        banner_timeout=60,
+        auth_timeout=30,
       )
+      # paramiko-level keep-alive: send an SSH ping every 30s on the Transport.
+      # This keeps the channel alive across NAT/proxy idle timeouts.
+      try:
+        client.get_transport().set_keepalive(30)
+      except Exception:
+        pass
       break
     except Exception as e:
       last_err = e
