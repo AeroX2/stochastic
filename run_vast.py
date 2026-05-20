@@ -301,6 +301,14 @@ def find_or_create_instance(vast: VastClient) -> tuple[int, int, bool]:
     except Exception:
       num_gpus = 1
     print(f"Reusing existing instance id: {inst_id} with num_gpus={num_gpus}")
+    # Nudge instance to running if it's stopped (idempotent on already-running).
+    intended = chosen.get("intended_status")
+    if intended != "running":
+      try:
+        vast.start_instance(id=inst_id)
+        print(f"  Sent start_instance({inst_id}); was intended={intended}.")
+      except Exception as e:
+        print(f"  Warning: start_instance({inst_id}) failed: {e}")
     return inst_id, num_gpus, False
 
   # No existing instance; go through the offer → create flow.
