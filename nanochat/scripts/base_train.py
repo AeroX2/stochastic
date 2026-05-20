@@ -40,7 +40,7 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb_run", "--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging). Note: --run renamed to --wandb_run to avoid prefix collision with torchrun's --run-path arg under newer torch's argparse.")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -98,8 +98,8 @@ else:
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+use_dummy_wandb = args.wandb_run == "dummy" or not master_process
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.wandb_run, config=user_config)
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3

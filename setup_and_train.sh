@@ -204,7 +204,7 @@ fi
 TRAIN_ARGS=(
   --variant="$VARIANT"
   --depth="$DEPTH"
-  --run="$RUN"
+  --wandb_run="$RUN"
   --device-batch-size="$DEVICE_BATCH_SIZE"
 )
 [[ -n "$NUM_ITERATIONS" ]] && TRAIN_ARGS+=(--num-iterations="$NUM_ITERATIONS")
