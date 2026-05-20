@@ -53,9 +53,13 @@ from vastai_sdk import VastAI as VastClient
 
 
 TEMPLATE_HASH = "cf10248a1d803b250a4382ca71fa9c50"
-MAX_BID = 5.0          # absolute cap $/hr per machine
+# MAX_BID is the hard cap $/hr per machine. Raised from 5.0 to 10.0 so we can
+# accept on-demand 8x A100 (~$8.81/hr) and not just bid-priced 4-GPU offers.
+# On-demand mode (VAST_OFFER_TYPE=on-demand) does not auto-preempt mid-run, so
+# the extra cost buys reliability vs the bid market's spurious preemptions.
+MAX_BID = float(os.environ.get("VAST_MAX_BID", "10.0"))
 DISK_GB = 100          # local disk size in GB when creating a new instance
-BID_HEADROOM = 0.35    # bid up to 15% above min_bid to win interrupts
+BID_HEADROOM = 0.35    # bid up to 35% above min_bid (bid market only)
 
 DEFAULT_REPO_URL = "https://github.com/AeroX2/stochastic.git"
 DEFAULT_GIT_REF = "main"
@@ -112,9 +116,10 @@ def find_offer_id(vast: VastClient) -> int:
   blacklist = {s.strip() for s in blacklist_raw.split(",") if s.strip()}
   if blacklist:
     print(f"Offer blacklist: {sorted(blacklist)}")
-  print(f"Searching Vast offers (>={MIN_GPUS} GPUs, bid <= ${MAX_BID}, reliability>0.95)...")
+  offer_type = os.environ.get("VAST_OFFER_TYPE", "bid")
+  print(f"Searching Vast {offer_type} offers (>={MIN_GPUS} GPUs, reliability>0.95)...")
   try:
-    out = vast.search_offers(query=GPU_QUERY, type="bid", order="dph-")
+    out = vast.search_offers(query=GPU_QUERY, type=offer_type, order="dph-")
   except Exception as e:
     raise SystemExit(f"vast_sdk.search_offers failed: {e}")
 
@@ -163,17 +168,19 @@ def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int, bool]:
   This avoids depending on the exact JSON shape / return value of
   `create_instance`, which differs across Vast.ai versions.
   """
-  print(f"Creating instance from template hash {TEMPLATE_HASH} with dynamic bid scaling...")
+  offer_type = os.environ.get("VAST_OFFER_TYPE", "bid")
+  print(f"Creating instance from template hash {TEMPLATE_HASH} (type={offer_type})...")
 
-  # Look up the chosen offer so we can scale bid price with GPU count and min_bid.
+  # Look up the chosen offer so we can scale price with GPU count and floor price.
   try:
-    offer_info = vast.search_offers(query=f"id={offer_id}", type="bid", order="dph-")
+    offer_info = vast.search_offers(query=f"id={offer_id}", type=offer_type, order="dph-")
   except Exception as e:
     print(f"Warning: vast.search_offers(id={offer_id}) failed; falling back to flat MAX_BID: {e}")
     offer_info = []
 
   num_gpus = 1
   min_bid = 0.0
+  dph_total = 0.0
   if isinstance(offer_info, list) and offer_info:
     offer = offer_info[0]
     try:
@@ -184,19 +191,25 @@ def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int, bool]:
       min_bid = float(offer.get("min_bid", 0.0))
     except Exception:
       min_bid = 0.0
+    try:
+      dph_total = float(offer.get("dph_total", 0.0))
+    except Exception:
+      dph_total = 0.0
 
-  # Use the market's own min_bid as baseline and add a small headroom,
-  # clamped by a global MAX_BID cap. This automatically accounts for
-  # H200 > H100 > A100 price tiers and scales with GPU count.
-  if min_bid <= 0:
-    # Fallback if API doesn't return min_bid: conservative flat cap.
-    base_bid = MAX_BID
+  if offer_type == "on-demand":
+    # On-demand offers are billed at dph_total. Pass that as bid_price so the
+    # SDK accepts the price; instance won't be preempted on bid auctions.
+    base_price = dph_total if dph_total > 0 else MAX_BID
+    bid_price = min(MAX_BID, base_price)
   else:
-    base_bid = min_bid
+    # Bid market: pay min_bid + headroom to win interrupts, capped at MAX_BID.
+    base_price = min_bid if min_bid > 0 else MAX_BID
+    bid_price = min(MAX_BID, base_price * (1.0 + BID_HEADROOM))
 
-  bid_price = min(MAX_BID, base_bid * (1.0 + BID_HEADROOM))
-
-  print(f"Selected offer {offer_id} with num_gpus={num_gpus}, min_bid={min_bid:.4f}, bid_price={bid_price:.4f}")
+  print(
+    f"Selected offer {offer_id} type={offer_type} num_gpus={num_gpus} "
+    f"min_bid={min_bid:.4f} dph={dph_total:.4f} bid_price={bid_price:.4f}"
+  )
 
   # Snapshot existing instance IDs first
   try:
@@ -376,6 +389,28 @@ def run_remote_training(
 ) -> None:
   """Run the remote bootstrap + multi-variant training over Paramiko and save logs locally."""
   log_dir.mkdir(parents=True, exist_ok=True)
+
+  # Which variants to run, in order. Default = all four. Per-iter override via
+  # VAST_VARIANTS=spiking (or "spiking,stochastic", etc) saves GPU time when we
+  # already know the baseline number and only need to measure the others.
+  _all_variant_repos = {
+    "baseline": HF_REPO_BASELINE,
+    "spiking": HF_REPO_SPIKING,
+    "stochastic": HF_REPO_STOCHASTIC,
+    "both": HF_REPO_BOTH,
+  }
+  variants_env = os.environ.get("VAST_VARIANTS", "baseline,spiking,stochastic,both")
+  variants_to_run: list[str] = []
+  for v in variants_env.split(","):
+    v = v.strip()
+    if v and v in _all_variant_repos:
+      variants_to_run.append(v)
+  if not variants_to_run:
+    raise SystemExit(f"VAST_VARIANTS produced no valid variants: {variants_env!r}")
+  variant_commands = "\n".join(
+    f"run_variant {v} {_all_variant_repos[v]}" for v in variants_to_run
+  )
+  print(f"Will run variants: {variants_to_run}")
   timestamp = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
   log_path = log_dir / f"vast_run_{timestamp}.log"
 
@@ -476,10 +511,7 @@ run_variant() {{
   fi
 }}
 
-run_variant baseline   {HF_REPO_BASELINE}
-run_variant spiking    {HF_REPO_SPIKING}
-run_variant stochastic {HF_REPO_STOCHASTIC}
-run_variant both       {HF_REPO_BOTH}
+{variant_commands}
 
 echo "Remote: all variants attempted."
 """
