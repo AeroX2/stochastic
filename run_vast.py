@@ -37,6 +37,15 @@ import shlex
 import argparse
 import sys
 import time
+
+# Windows console defaults to cp1252 which can't encode ANSI/Unicode characters
+# emitted by the remote training (rustbpe progress lines, tmux escapes, etc.).
+# Force UTF-8 with replace so streaming never crashes the local process.
+try:
+  sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+  sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+  pass
 from typing import Optional
 
 import paramiko
