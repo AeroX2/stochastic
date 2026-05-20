@@ -265,14 +265,30 @@ def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int, bool]:
           continue
         if inst_id not in prev_ids:
           print(f"Instance created with id: {inst_id}")
-          # Some Vast offers (on-demand especially) come up in `intended=stopped`
-          # state and need an explicit start to run the container. Send start
-          # unconditionally -- it's a no-op for already-running instances.
-          try:
-            vast.start_instance(id=inst_id)
-            print(f"  Sent start_instance({inst_id}).")
-          except Exception as e:
-            print(f"  Warning: start_instance({inst_id}) failed: {e}")
+          # On-demand B200/H100 instances come up with intended_status="stopped"
+          # and the docker image still loading. start_instance() issued before
+          # image-loaded gets silently dropped (saw this on both 37152841 and
+          # 37152846). Retry start_instance every 10s until intended==running
+          # actually sticks, up to 5 minutes.
+          start_deadline = time.time() + 300
+          while time.time() < start_deadline:
+            try:
+              vast.start_instance(id=inst_id)
+            except Exception as e:
+              print(f"  Warning: start_instance({inst_id}) raised: {e}")
+            time.sleep(8)
+            try:
+              latest = vast.show_instances() or []
+            except Exception:
+              latest = []
+            cur = next((r for r in latest if int(r.get("id", -1)) == inst_id), None)
+            if cur and cur.get("intended_status") == "running":
+              print(f"  start_instance({inst_id}) acknowledged; intended=running.")
+              break
+            else:
+              print(f"  intended still {cur.get('intended_status') if cur else '?'}; retrying start_instance...")
+          else:
+            print(f"  Warning: start_instance({inst_id}) never flipped intended to running in 5 min.")
           return inst_id, num_gpus, True
 
     print("  New instance not visible yet; sleeping 10s...")
