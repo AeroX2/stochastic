@@ -103,7 +103,15 @@ def find_offer_id(vast: VastClient) -> int:
   bid<=MAX_BID, reliability>0.95), then rank by (num_gpus desc, min_bid asc).
   Higher GPU count first because per-iter wall-clock dominates the budget, then
   cheapest-of-the-best so we don't overpay.
+
+  Honors VAST_OFFER_BLACKLIST env var (comma-separated offer ids) to skip
+  offers whose underlying host was just discovered to have full disk or other
+  per-host issues in this session.
   """
+  blacklist_raw = os.environ.get("VAST_OFFER_BLACKLIST", "")
+  blacklist = {s.strip() for s in blacklist_raw.split(",") if s.strip()}
+  if blacklist:
+    print(f"Offer blacklist: {sorted(blacklist)}")
   print(f"Searching Vast offers (>={MIN_GPUS} GPUs, bid <= ${MAX_BID}, reliability>0.95)...")
   try:
     out = vast.search_offers(query=GPU_QUERY, type="bid", order="dph-")
@@ -114,6 +122,12 @@ def find_offer_id(vast: VastClient) -> int:
     raise SystemExit(
       f"No offers matched: {GPU_QUERY}. "
       f"The market may not currently have {MIN_GPUS}+ GPU bid offers; try lowering MIN_GPUS or raising MAX_BID."
+    )
+
+  filtered = [o for o in out if str(o.get("id")) not in blacklist]
+  if not filtered:
+    raise SystemExit(
+      f"All {len(out)} offers matching {GPU_QUERY!r} are blacklisted: {sorted(blacklist)}."
     )
 
   def _key(o):
@@ -128,7 +142,7 @@ def find_offer_id(vast: VastClient) -> int:
     # (more GPUs first, then cheapest)
     return (-gpus, bid)
 
-  ranked = sorted(out, key=_key)
+  ranked = sorted(filtered, key=_key)
   best = ranked[0]
   offer_id = int(best["id"])
   print(
