@@ -577,10 +577,24 @@ echo "Remote: all variants attempted."
   finally:
     client.close()
 
-  if exit_status not in (0, 130):  # 130 = tail interrupted is fine; remote still ran
-    print(f"Warning: tail exited with code {exit_status}. The remote training may still be running. See {log_path}.", file=sys.stderr)
-
+  # Distinguish "training actually finished" from "our local view got cut off".
+  # tail's normal clean exit when --pid dies is 0. Paramiko returns -1 when the
+  # SSH channel was torn down without an exit status (network blip, Bash-tool
+  # SIGTERM, peer reset). In that case the remote training is almost certainly
+  # still alive (it's nohup'd) and we must NOT let main()'s finally auto-destroy
+  # the instance. Raise so the outer try sees an exception and skips destroy.
   print(f"Remote training log captured to {log_path}")
+  if exit_status == 0:
+    return
+  if exit_status == 130:
+    # tail was SIGINT'd locally; remote process state unknown -- treat as interrupted.
+    raise RuntimeError(f"Local tail interrupted (SIGINT). Remote training may still be running. See {log_path}.")
+  if exit_status == -1:
+    raise RuntimeError(
+      f"SSH channel closed without exit status (likely local timeout / network blip). "
+      f"Remote training is nohup'd and may still be running. Re-run run_vast.py to resume tailing. See {log_path}."
+    )
+  raise RuntimeError(f"tail exited with non-zero status {exit_status}. See {log_path}.")
 
 
 def destroy_instance(instance_id: int, vast: VastClient) -> None:
