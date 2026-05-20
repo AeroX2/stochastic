@@ -442,32 +442,77 @@ echo "Remote: all variants attempted."
   else:
     raise SystemExit(f"Failed to connect via SSH using Paramiko after multiple attempts: {last_err}")
 
-  try:
-    stdin, stdout, stderr = client.exec_command("bash -s", get_pty=True)
-    stdin.write(remote_script)
-    stdin.channel.shutdown_write()
+  # Strategy: write the script to the remote via SFTP, launch with nohup so it
+  # survives SSH/network disconnects, then tail -F the remote log. If our local
+  # tail dies (timeout, network), the remote training keeps running and we can
+  # re-attach via another invocation (the script's pgrep branch resumes the tail).
+  REMOTE_SCRIPT = "/workspace/iter_run.sh"
+  REMOTE_LOG = "/workspace/iter_run.log"
+  REMOTE_PIDFILE = "/workspace/iter_run.pid"
 
-    # Stream logs to console and file
+  try:
+    # Disable auto-tmux on first connect; otherwise the welcome-tmux corrupts logs.
+    client.exec_command("touch ~/.no_auto_tmux")
+
+    # 1. Upload the remote script via SFTP.
+    sftp = client.open_sftp()
+    try:
+      with sftp.open(REMOTE_SCRIPT, "w") as f:
+        f.write(remote_script)
+      sftp.chmod(REMOTE_SCRIPT, 0o755)
+    finally:
+      sftp.close()
+
+    # 2. If no prior training is running, start a new one detached via nohup.
+    submit_cmd = (
+      f"set -e; "
+      f"if [ -f {REMOTE_PIDFILE} ] && kill -0 $(cat {REMOTE_PIDFILE}) 2>/dev/null; then "
+      f"  echo \"Remote: training already in progress (pid=$(cat {REMOTE_PIDFILE}))\"; "
+      f"else "
+      f"  nohup bash {REMOTE_SCRIPT} > {REMOTE_LOG} 2>&1 < /dev/null & "
+      f"  echo $! > {REMOTE_PIDFILE}; "
+      f"  echo \"Remote: training submitted, pid=$(cat {REMOTE_PIDFILE}), log={REMOTE_LOG}\"; "
+      f"fi"
+    )
+    _stdin, _stdout, _stderr = client.exec_command(submit_cmd)
+    submit_out = _stdout.read().decode("utf-8", errors="replace")
+    submit_err = _stderr.read().decode("utf-8", errors="replace")
+    submit_rc = _stdout.channel.recv_exit_status()
+    print(submit_out, end="")
+    if submit_err:
+      print(submit_err, end="", file=sys.stderr)
+    if submit_rc != 0:
+      raise SystemExit(f"Submit failed (exit {submit_rc}). stdout: {submit_out!r} stderr: {submit_err!r}")
+
+    # 3. Tail -F the remote log; tail exits when the training pid is gone.
+    tail_cmd = (
+      f"PID=$(cat {REMOTE_PIDFILE} 2>/dev/null); "
+      f"tail -n +1 -F {REMOTE_LOG} ${{PID:+--pid=$PID}} 2>/dev/null"
+    )
+    stdin, stdout, stderr = client.exec_command(tail_cmd, bufsize=1)
+
+    # Stream logs to console and file. flush() on every line so the local file
+    # is always usable for parsing CORE metrics even mid-run.
     with log_path.open("w", encoding="utf-8") as f:
       for line in iter(stdout.readline, ""):
         if not line:
           break
         sys.stdout.write(line)
         f.write(line)
-      # Drain any remaining stderr at the end
+        f.flush()
       err_rest = stderr.read()
       if err_rest:
-        sys.stdout.write(err_rest)
-        f.write(err_rest)
+        sys.stdout.write(err_rest.decode("utf-8", errors="replace") if isinstance(err_rest, bytes) else err_rest)
+        f.write(err_rest.decode("utf-8", errors="replace") if isinstance(err_rest, bytes) else err_rest)
 
     exit_status = stdout.channel.recv_exit_status()
   finally:
     client.close()
 
-  if exit_status != 0:
-    raise SystemExit(f"Remote training script exited with code {exit_status}. See {log_path}.")
+  if exit_status not in (0, 130):  # 130 = tail interrupted is fine; remote still ran
+    print(f"Warning: tail exited with code {exit_status}. The remote training may still be running. See {log_path}.", file=sys.stderr)
 
-  print(f"Remote training completed successfully. Logs saved to {log_path}")
+  print(f"Remote training log captured to {log_path}")
 
 
 def destroy_instance(instance_id: int, vast: VastClient) -> None:
