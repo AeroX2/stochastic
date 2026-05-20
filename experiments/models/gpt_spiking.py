@@ -67,7 +67,12 @@ class GPTSpiking(GPT):
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([
-                SpikingBlock(config, i) if (i % 2 == 0) else BaseBlock(config, i)
+                # Spiking on every 3rd block (33% spiking density) instead of every 2nd (50%).
+                # Iter 1 spiking variant at 50% landed canonical CORE 0.1199 -- 0.003 below
+                # the 0.1225 threshold. Halving the spiking layer count preserves more
+                # dense-MLP capacity; the surrogate-gradient ternary spikes lose enough
+                # information per layer that fewer of them should close the gap to baseline.
+                SpikingBlock(config, i) if (i % 3 == 0) else BaseBlock(config, i)
                 for i in range(config.n_layer)
             ]),
         })
