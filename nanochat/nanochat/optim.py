@@ -463,10 +463,17 @@ class DistMuonAdamW(torch.optim.Optimizer):
         state = self.state[p]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        # Muon needs at least 2D tensors; skip 1D/scalar params gracefully.
+        if len(shape) < 2:
+            # Still need a placeholder for second_momentum_buffer to keep indexing valid.
+            if "second_momentum_buffer" not in state:
+                state["second_momentum_buffer"] = torch.zeros((chunk_size, 1, 1), dtype=dtype, device=device)
+            red_dim = -1
+        else:
+            if "second_momentum_buffer" not in state:
+                state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+                state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Build output buffer for all_gather
         updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
@@ -478,14 +485,26 @@ class DistMuonAdamW(torch.optim.Optimizer):
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
             self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            if len(shape) >= 2:
+                lr_scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
+            else:
+                lr_scale = 1.0
+            self._muon_lr_t.fill_(group["lr"] * lr_scale)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
-                grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
-            )
+
+            # For 1D/scalar params, skip Muon fused kernel and fall back to plain momentum-like update.
+            if len(shape) >= 2:
+                muon_step_fused(
+                    grad_chunk[:num_owned], stacked_owned,
+                    state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                    self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                    group["ns_steps"], red_dim,
+                )
+            else:
+                mbuf = state["momentum_buffer"][:num_owned]
+                mbuf.mul_(group["momentum"]).add_(grad_chunk[:num_owned])
+                stacked_owned.add_(mbuf, alpha=-group["lr"])
+
             updated_params[:num_owned].copy_(stacked_owned)
 
         if num_owned < chunk_size:

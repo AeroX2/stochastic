@@ -34,6 +34,7 @@ import datetime as _dt
 import os
 import pathlib
 import shlex
+import argparse
 import sys
 import time
 from typing import Optional
@@ -46,6 +47,9 @@ TEMPLATE_HASH = "cf10248a1d803b250a4382ca71fa9c50"
 MAX_BID = 5.0          # absolute cap $/hr per machine
 DISK_GB = 100          # local disk size in GB when creating a new instance
 BID_HEADROOM = 0.35    # bid up to 15% above min_bid to win interrupts
+
+DEFAULT_REPO_URL = "https://github.com/AeroX2/stochastic.git"
+DEFAULT_GIT_REF = "main"
 
 # Search query for H100 / H200 / A100 class at or below MAX_BID (bid / interruptible pricing)
 GPU_QUERY = (
@@ -94,11 +98,11 @@ def find_offer_id(vast: VastClient) -> int:
   return offer_id
 
 
-def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int]:
+def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int, bool]:
   """Create an instance from the given offer using the VastAI SDK and
   infer its id by diffing `show_instances` before/after.
 
-  Returns (instance_id, num_gpus).
+  Returns (instance_id, num_gpus, created_here=True).
 
   This avoids depending on the exact JSON shape / return value of
   `create_instance`, which differs across Vast.ai versions.
@@ -185,7 +189,7 @@ def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int]:
           continue
         if inst_id not in prev_ids:
           print(f"Instance created with id: {inst_id}")
-          return inst_id, num_gpus
+          return inst_id, num_gpus, True
 
     print("  New instance not visible yet; sleeping 10s...")
     time.sleep(10)
@@ -193,10 +197,10 @@ def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int]:
   raise SystemExit("Timed out waiting for new instance to appear in show_instances after create_instance.")
 
 
-def find_or_create_instance(vast: VastClient) -> tuple[int, int]:
+def find_or_create_instance(vast: VastClient) -> tuple[int, int, bool]:
   """Reuse an existing instance if available, otherwise create a new one.
 
-  Returns (instance_id, num_gpus).
+  Returns (instance_id, num_gpus, created_here).
   """
   print("Checking for existing Vast instances...")
   try:
@@ -220,7 +224,7 @@ def find_or_create_instance(vast: VastClient) -> tuple[int, int]:
     except Exception:
       num_gpus = 1
     print(f"Reusing existing instance id: {inst_id} with num_gpus={num_gpus}")
-    return inst_id, num_gpus
+    return inst_id, num_gpus, False
 
   # No existing instance; go through the offer → create flow.
   offer_id = find_offer_id(vast)
@@ -306,7 +310,14 @@ def wait_for_ssh_details(instance_id: int, vast: VastClient, timeout_minutes: in
   }
 
 
-def run_remote_training(ssh_info: dict, hf_token: str, log_dir: pathlib.Path) -> None:
+def run_remote_training(
+  ssh_info: dict,
+  hf_token: str,
+  log_dir: pathlib.Path,
+  *,
+  repo_url: str = DEFAULT_REPO_URL,
+  git_ref: str = DEFAULT_GIT_REF,
+) -> None:
   """Run the remote bootstrap + multi-variant training over Paramiko and save logs locally."""
   log_dir.mkdir(parents=True, exist_ok=True)
   timestamp = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -315,6 +326,9 @@ def run_remote_training(ssh_info: dict, hf_token: str, log_dir: pathlib.Path) ->
   remote_script = f"""set -euo pipefail
 
 export HF_TOKEN={hf_token}
+
+REPO_URL={shlex.quote(repo_url)}
+GIT_REF={shlex.quote(git_ref)}
 
 echo "Remote: checking for git and python3..."
 if ! command -v git &>/dev/null; then
@@ -345,25 +359,52 @@ if ! command -v python3 &>/dev/null; then
   fi
 fi
 
-if [[ ! -d stochastic ]]; then
+echo "Remote: syncing repo ($REPO_URL) at ref ($GIT_REF)..."
+if [[ ! -d stochastic/.git ]]; then
+  rm -rf stochastic
   echo "Remote: cloning stochastic repo..."
-  git clone https://github.com/AeroX2/stochastic.git
+  git clone "$REPO_URL" stochastic
 fi
 
 cd stochastic
+
+# Always sync to requested ref (branch/tag/sha). If it's a branch on origin, prefer origin/<branch>.
+git remote set-url origin "$REPO_URL" || true
+git fetch --prune origin
+if git show-ref --verify --quiet "refs/remotes/origin/$GIT_REF"; then
+  git checkout -B "$GIT_REF" "origin/$GIT_REF"
+  git reset --hard "origin/$GIT_REF"
+else
+  # Could be a tag or sha (or a non-origin remote ref)
+  git checkout --detach "$GIT_REF"
+fi
+git clean -fdx
+echo "Remote: checked out $(git rev-parse --short HEAD)"
+
+# If a training process is already running, just stream its log and exit.
+if pgrep -f "experiments.train" >/dev/null 2>&1; then
+  echo "Remote: training already running, streaming log..."
+  if [[ -f train.log ]]; then
+    tail -n 200 -f train.log
+  else
+    echo "Remote: train.log not found; attach manually via ssh."
+  fi
+  exit 0
+fi
+
 chmod +x setup_and_train.sh
 
 echo "Remote: running baseline variant..."
-./setup_and_train.sh --variant=baseline   --hf-repo={HF_REPO_BASELINE} --save-every=500
+./setup_and_train.sh --variant=baseline   --hf-repo={HF_REPO_BASELINE} --save-every=500 2>&1 | tee -a train.log
 
 echo "Remote: running spiking variant..."
-./setup_and_train.sh --variant=spiking    --hf-repo={HF_REPO_SPIKING} --save-every=500
+./setup_and_train.sh --variant=spiking    --hf-repo={HF_REPO_SPIKING} --save-every=500 2>&1 | tee -a train.log
 
 echo "Remote: running stochastic variant..."
-./setup_and_train.sh --variant=stochastic --hf-repo={HF_REPO_STOCHASTIC} --save-every=500
+./setup_and_train.sh --variant=stochastic --hf-repo={HF_REPO_STOCHASTIC} --save-every=500 2>&1 | tee -a train.log
 
 echo "Remote: running both variant..."
-./setup_and_train.sh --variant=both       --hf-repo={HF_REPO_BOTH} --save-every=500
+./setup_and_train.sh --variant=both       --hf-repo={HF_REPO_BOTH} --save-every=500 2>&1 | tee -a train.log
 
 echo "Remote: all variants completed successfully."
 """
@@ -482,18 +523,37 @@ def _prompt_destroy_with_timeout(instance_id: int, timeout_seconds: int = 300) -
 
 
 def main() -> None:
+  parser = argparse.ArgumentParser(description="Vast.ai stochastic training launcher")
+  parser.add_argument(
+    "--repo-url",
+    default=DEFAULT_REPO_URL,
+    help=f"Git repo URL to clone on remote (default: {DEFAULT_REPO_URL})",
+  )
+  parser.add_argument(
+    "--git-ref",
+    default=DEFAULT_GIT_REF,
+    help=f"Git ref to checkout on remote (branch/tag/sha). Default: {DEFAULT_GIT_REF}",
+  )
+  args = parser.parse_args()
+
   vast_api_key = _require_env("VAST_API_KEY")
   hf_token = _require_env("HF_TOKEN")
   vast = _get_vast_client(vast_api_key)
 
   instance_id: Optional[int] = None
   try:
-    instance_id, _ = find_or_create_instance(vast)
+    instance_id, _, created_here = find_or_create_instance(vast)
     ssh_info = wait_for_ssh_details(instance_id, vast)
     logs_dir = pathlib.Path("vast_logs")
-    run_remote_training(ssh_info, hf_token, logs_dir)
+    run_remote_training(
+      ssh_info,
+      hf_token,
+      logs_dir,
+      repo_url=args.repo_url,
+      git_ref=args.git_ref,
+    )
   finally:
-    if instance_id is not None:
+    if instance_id is not None and created_here:
       if _prompt_destroy_with_timeout(instance_id):
         destroy_instance(instance_id, vast)
       else:
