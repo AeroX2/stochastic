@@ -372,6 +372,18 @@ export HF_TOKEN={hf_token}
 REPO_URL={shlex.quote(repo_url)}
 GIT_REF={shlex.quote(git_ref)}
 
+# Disk health check: bail fast on hosts whose overlay is already near-full.
+# Other tenants on the same Vast host can saturate the shared overlay even when
+# our instance quota is 100GB. Training will crash mid-checkpoint with
+# "inline_container.cc:672 unexpected pos N vs M" if disk runs out.
+FREE_KB=$(df --output=avail / | tail -1 | tr -d ' ')
+FREE_GB=$((FREE_KB / 1024 / 1024))
+echo "Remote: free disk on / = ${{FREE_GB}}GB"
+if [ "$FREE_GB" -lt 30 ]; then
+  echo "Remote: ABORT - free disk ${{FREE_GB}}GB < 30GB threshold. Host overlay too full for safe training. Exiting so launcher can pick a different offer."
+  exit 42
+fi
+
 echo "Remote: checking for git and python3..."
 if ! command -v git &>/dev/null; then
   if command -v apt-get &>/dev/null; then
