@@ -639,6 +639,8 @@ def main() -> None:
   vast = _get_vast_client(vast_api_key)
 
   instance_id: Optional[int] = None
+  created_here = False
+  training_returned = False
   try:
     instance_id, _, created_here = find_or_create_instance(vast)
     ssh_info = wait_for_ssh_details(instance_id, vast)
@@ -650,9 +652,18 @@ def main() -> None:
       repo_url=args.repo_url,
       git_ref=args.git_ref,
     )
+    training_returned = True
   finally:
     if instance_id is not None and created_here:
-      if _prompt_destroy_with_timeout(instance_id):
+      if not training_returned:
+        # Local launcher was interrupted (Bash-tool timeout, network blip, SIGTERM, etc.)
+        # The remote nohup'd training may still be running. Leave the instance alive so
+        # a subsequent run_vast.py call can re-attach via the existing pidfile/log.
+        print(
+          f"Leaving instance {instance_id} running: local launcher exited before training returned. "
+          f"Re-run `python run_vast.py --git-ref {args.git_ref}` to resume tailing the remote log."
+        )
+      elif _prompt_destroy_with_timeout(instance_id):
         destroy_instance(instance_id, vast)
       else:
         print(f"Leaving instance {instance_id} running.")
