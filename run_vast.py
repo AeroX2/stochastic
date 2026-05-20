@@ -74,11 +74,12 @@ MIN_GPUS = 4
 # which crashed training mid-checkpoint; filter them out at search time.
 MIN_DISK_GB = int(os.environ.get("VAST_MIN_DISK_GB", "100"))
 
-# Restricted to H-series only. A100 was working but ~3x slower per step
-# (spiking on 8xA100 PCIE took ~75min); H100/H200 cuts wall-clock at a higher
-# $/hr. To re-enable A100 add their gpu_names back to the list.
+# H-series + B-series (Hopper + Blackwell). A100 dropped because it was ~3x
+# slower than H100 at similar bid prices. B200 is the fastest and often the
+# cheapest per FLOP on Vast.ai, but availability fluctuates -- include both
+# so the search finds whichever is currently rentable.
 GPU_QUERY = (
-  f"gpu_name in [\"H100_PCIE\", \"H100_SXM\", \"H100_NVL\", \"H200\"] "
+  f"gpu_name in [\"H100_PCIE\", \"H100_SXM\", \"H100_NVL\", \"H200\", \"B200\", \"B200_SXM\"] "
   f"num_gpus>={MIN_GPUS} min_bid<={MAX_BID} reliability>0.95 disk_space>={MIN_DISK_GB}"
 )
 
