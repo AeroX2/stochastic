@@ -394,19 +394,26 @@ fi
 
 chmod +x setup_and_train.sh
 
-echo "Remote: running baseline variant..."
-./setup_and_train.sh --variant=baseline   --hf-repo={HF_REPO_BASELINE} --save-every=500 2>&1 | tee -a train.log
+# Run each variant in a subshell so a failure (set -e or non-zero exit through pipefail)
+# doesn't abort the remaining variants. Print a clear marker on failure so log parsing
+# can distinguish "variant ran and got a CORE metric" from "variant crashed".
+run_variant() {{
+  local variant="$1"
+  local hf_repo="$2"
+  echo "Remote: running $variant variant..."
+  if (set -eo pipefail; ./setup_and_train.sh --variant="$variant" --hf-repo="$hf_repo" --save-every=500 2>&1 | tee -a train.log); then
+    echo "Remote: $variant variant SUCCEEDED"
+  else
+    echo "Remote: $variant variant FAILED (continuing to next variant)"
+  fi
+}}
 
-echo "Remote: running spiking variant..."
-./setup_and_train.sh --variant=spiking    --hf-repo={HF_REPO_SPIKING} --save-every=500 2>&1 | tee -a train.log
+run_variant baseline   {HF_REPO_BASELINE}
+run_variant spiking    {HF_REPO_SPIKING}
+run_variant stochastic {HF_REPO_STOCHASTIC}
+run_variant both       {HF_REPO_BOTH}
 
-echo "Remote: running stochastic variant..."
-./setup_and_train.sh --variant=stochastic --hf-repo={HF_REPO_STOCHASTIC} --save-every=500 2>&1 | tee -a train.log
-
-echo "Remote: running both variant..."
-./setup_and_train.sh --variant=both       --hf-repo={HF_REPO_BOTH} --save-every=500 2>&1 | tee -a train.log
-
-echo "Remote: all variants completed successfully."
+echo "Remote: all variants attempted."
 """
 
   print(f"Starting remote bootstrap and training via Paramiko (logs -> {log_path})...")
@@ -477,7 +484,20 @@ def _prompt_destroy_with_timeout(instance_id: int, timeout_seconds: int = 300) -
 
   Returns True if we should destroy, False otherwise. If there is no
   input within `timeout_seconds`, defaults to destroying the instance.
+
+  When run non-interactively (no TTY on stdin) or VAST_AUTO_DESTROY=1, skip the
+  prompt entirely and destroy immediately. This keeps automated loops from
+  waiting on a tty that will never come.
   """
+  auto_destroy = os.environ.get("VAST_AUTO_DESTROY") == "1"
+  try:
+    is_tty = sys.stdin.isatty()
+  except Exception:
+    is_tty = False
+  if auto_destroy or not is_tty:
+    print(f"\nInstance {instance_id}: non-interactive run, auto-destroying.", flush=True)
+    return True
+
   print(
     f"\nInstance {instance_id} is still running.\n"
     f"Destroy it now? [Y/n] (auto-destroy in {timeout_seconds // 60} minutes if no input)...",
