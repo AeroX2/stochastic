@@ -74,11 +74,11 @@ MIN_GPUS = 4
 # which crashed training mid-checkpoint; filter them out at search time.
 MIN_DISK_GB = int(os.environ.get("VAST_MIN_DISK_GB", "100"))
 
-# Search query for H100 / H200 / A100 class at or below MAX_BID (bid / interruptible pricing).
-# Filter on reliability to avoid offers that get preempted before training finishes,
-# and on disk_space so we land on a host that can actually fit our checkpoint dir.
+# Restricted to H-series only. A100 was working but ~3x slower per step
+# (spiking on 8xA100 PCIE took ~75min); H100/H200 cuts wall-clock at a higher
+# $/hr. To re-enable A100 add their gpu_names back to the list.
 GPU_QUERY = (
-  f"gpu_name in [\"H100_PCIE\", \"H100_SXM\", \"H100_NVL\", \"H200\", \"A100_PCIE\", \"A100_SXM4\"] "
+  f"gpu_name in [\"H100_PCIE\", \"H100_SXM\", \"H100_NVL\", \"H200\"] "
   f"num_gpus>={MIN_GPUS} min_bid<={MAX_BID} reliability>0.95 disk_space>={MIN_DISK_GB}"
 )
 
@@ -523,6 +523,12 @@ run_variant() {{
 {variant_commands}
 
 echo "Remote: all variants attempted."
+# Print a sentinel line as the very last thing iter_run.sh emits. The local
+# tail -F --pid=$PID can hang on a static log even after PID dies (it only
+# polls on I/O); writing this final line wakes tail up so it notices the pid
+# is gone and exits cleanly. The local launcher parses this to know we hit a
+# normal completion vs a network disconnect.
+echo "Remote: __ITER_RUN_DONE__"
 """
 
   print(f"Starting remote bootstrap and training via Paramiko (logs -> {log_path})...")
