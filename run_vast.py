@@ -51,10 +51,16 @@ BID_HEADROOM = 0.35    # bid up to 15% above min_bid to win interrupts
 DEFAULT_REPO_URL = "https://github.com/AeroX2/stochastic.git"
 DEFAULT_GIT_REF = "main"
 
-# Search query for H100 / H200 / A100 class at or below MAX_BID (bid / interruptible pricing)
+# Minimum useful GPU count. Below 4, training stretches into 6+ hour ranges per
+# variant which makes the iteration loop impractical. Iter 0 hit a 1-GPU offer
+# that would have been ~13 hours wall-clock for four variants.
+MIN_GPUS = 4
+
+# Search query for H100 / H200 / A100 class at or below MAX_BID (bid / interruptible pricing).
+# Filter on reliability to avoid offers that get preempted before training finishes.
 GPU_QUERY = (
   f"gpu_name in [\"H100_PCIE\", \"H100_SXM\", \"H100_NVL\", \"H200\", \"A100_PCIE\", \"A100_SXM4\"] "
-  f"num_gpus>=1 min_bid<={MAX_BID}"
+  f"num_gpus>={MIN_GPUS} min_bid<={MAX_BID} reliability>0.95"
 )
 
 # Default SSH private key (generated in repo root via ssh-keygen)
@@ -82,19 +88,46 @@ def _get_vast_client(api_key: str) -> VastClient:
 
 
 def find_offer_id(vast: VastClient) -> int:
-  """Use VastAI SDK to find a suitable 8x H100 interruptible offer."""
-  print(f"Searching Vast offers for 8x H100 (bid, min_bid <= ${MAX_BID})...")
+  """Find a suitable multi-GPU interruptible offer.
+
+  Strategy: search with GPU_QUERY (which already filters num_gpus>=MIN_GPUS,
+  bid<=MAX_BID, reliability>0.95), then rank by (num_gpus desc, min_bid asc).
+  Higher GPU count first because per-iter wall-clock dominates the budget, then
+  cheapest-of-the-best so we don't overpay.
+  """
+  print(f"Searching Vast offers (>={MIN_GPUS} GPUs, bid <= ${MAX_BID}, reliability>0.95)...")
   try:
-    # With raw=True this returns a list[dict] of offers (see search__offers in vast.py).
     out = vast.search_offers(query=GPU_QUERY, type="bid", order="dph-")
   except Exception as e:
     raise SystemExit(f"vast_sdk.search_offers failed: {e}")
 
   if not isinstance(out, list) or not out:
-    raise SystemExit("vast_sdk.search_offers returned no offers; cannot select offer id.")
+    raise SystemExit(
+      f"No offers matched: {GPU_QUERY}. "
+      f"The market may not currently have {MIN_GPUS}+ GPU bid offers; try lowering MIN_GPUS or raising MAX_BID."
+    )
 
-  offer_id = int(out[0]["id"])
-  print(f"Selected offer id: {offer_id}")
+  def _key(o):
+    try:
+      gpus = int(o.get("num_gpus", 0))
+    except Exception:
+      gpus = 0
+    try:
+      bid = float(o.get("min_bid", 0.0))
+    except Exception:
+      bid = 0.0
+    # (more GPUs first, then cheapest)
+    return (-gpus, bid)
+
+  ranked = sorted(out, key=_key)
+  best = ranked[0]
+  offer_id = int(best["id"])
+  print(
+    f"Selected offer id={offer_id} "
+    f"(gpu={best.get('gpu_name')}, n={best.get('num_gpus')}, "
+    f"min_bid={best.get('min_bid')}, dph={best.get('dph_total')}, "
+    f"reliability={best.get('reliability2')})"
+  )
   return offer_id
 
 
