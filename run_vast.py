@@ -69,11 +69,17 @@ DEFAULT_GIT_REF = "main"
 # that would have been ~13 hours wall-clock for four variants.
 MIN_GPUS = 4
 
+# Minimum host disk_space (GB) the offer must report. The 30GB threshold matches
+# the remote heredoc's df check. Offers with disk_space=11 returned 11GB total /
+# which crashed training mid-checkpoint; filter them out at search time.
+MIN_DISK_GB = int(os.environ.get("VAST_MIN_DISK_GB", "100"))
+
 # Search query for H100 / H200 / A100 class at or below MAX_BID (bid / interruptible pricing).
-# Filter on reliability to avoid offers that get preempted before training finishes.
+# Filter on reliability to avoid offers that get preempted before training finishes,
+# and on disk_space so we land on a host that can actually fit our checkpoint dir.
 GPU_QUERY = (
   f"gpu_name in [\"H100_PCIE\", \"H100_SXM\", \"H100_NVL\", \"H200\", \"A100_PCIE\", \"A100_SXM4\"] "
-  f"num_gpus>={MIN_GPUS} min_bid<={MAX_BID} reliability>0.95"
+  f"num_gpus>={MIN_GPUS} min_bid<={MAX_BID} reliability>0.95 disk_space>={MIN_DISK_GB}"
 )
 
 # Default SSH private key (generated in repo root via ssh-keygen)
@@ -345,17 +351,33 @@ def wait_for_ssh_details(instance_id: int, vast: VastClient, timeout_minutes: in
     actual = inst.get("actual_status")
     intended = inst.get("intended_status")
     if actual == "running":
+      # Prefer direct SSH (public_ipaddr + port 22's host mapping) over the
+      # proxy hostname. Vast.ai's proxies (ssh<N>.vast.ai) drop connections
+      # mid-handshake on many on-demand hosts, while direct works fine.
+      ports = inst.get("ports") or {}
+      direct = (ports.get("22/tcp") or [{}])[0]
+      direct_port = direct.get("HostPort")
+      public_ip = inst.get("public_ipaddr")
+      if public_ip and direct_port:
+        print(f"SSH endpoint ready (direct): ssh://root@{public_ip}:{direct_port}")
+        return {
+          "hostname": str(public_ip),
+          "username": "root",
+          "port": int(direct_port),
+          "key_filename": str(SSH_KEY_PATH),
+        }
+      # Fallback to proxy if direct port mapping not exposed.
       ssh_host = inst.get("ssh_host")
       ssh_port = inst.get("ssh_port")
       if ssh_host and ssh_port:
-        print(f"SSH endpoint ready: ssh://root@{ssh_host}:{ssh_port}")
+        print(f"SSH endpoint ready (proxy fallback): ssh://root@{ssh_host}:{ssh_port}")
         return {
           "hostname": str(ssh_host),
           "username": "root",
           "port": int(ssh_port),
           "key_filename": str(SSH_KEY_PATH),
         }
-      print(f"  instance running but ssh_host/ssh_port missing; retry in 15s...")
+      print(f"  instance running but no SSH details yet; retry in 15s...")
     else:
       print(f"  actual={actual} intended={intended}; retry in 15s...")
     time.sleep(15)
