@@ -258,6 +258,14 @@ def create_instance(offer_id: int, vast: VastClient) -> tuple[int, int, bool]:
           continue
         if inst_id not in prev_ids:
           print(f"Instance created with id: {inst_id}")
+          # Some Vast offers (on-demand especially) come up in `intended=stopped`
+          # state and need an explicit start to run the container. Send start
+          # unconditionally -- it's a no-op for already-running instances.
+          try:
+            vast.start_instance(id=inst_id)
+            print(f"  Sent start_instance({inst_id}).")
+          except Exception as e:
+            print(f"  Warning: start_instance({inst_id}) failed: {e}")
           return inst_id, num_gpus, True
 
     print("  New instance not visible yet; sleeping 10s...")
@@ -301,82 +309,53 @@ def find_or_create_instance(vast: VastClient) -> tuple[int, int, bool]:
 
 
 def wait_for_ssh_details(instance_id: int, vast: VastClient, timeout_minutes: int = 20) -> dict:
-  """Poll VastAI SDK `ssh_url` until SSH is ready, then parse into Paramiko connection details."""
-  print("Waiting for SSH endpoint to become available...")
+  """Poll until the instance is actually_status=running, then return SSH details
+  from show_instances (more reliable than ssh_url which has an off-by-one port quirk).
+  """
+  print(f"Waiting for instance {instance_id} to reach actual_status=running...")
   deadline = time.time() + timeout_minutes * 60
-  ssh_descriptor: Optional[str] = None
+  inst: Optional[dict] = None
 
   while time.time() < deadline:
     try:
-      # `ssh_url` prints the URL (e.g. ssh://root@host:port) to stdout;
-      # the SDK captures that in `last_output`.
-      vast.ssh_url(id=instance_id)
-      out = getattr(vast, "last_output", "") or ""
-    except Exception:
-      out = ""
-
-    out = out.strip()
-    if out:
-      # Take the last non-empty line in case of extra output
-      for ln in reversed(out.splitlines()):
-        if ln.strip():
-          ssh_descriptor = ln.strip()
-          break
-
-    if ssh_descriptor and not ssh_descriptor.lower().startswith("error:"):
-      print(f"SSH endpoint ready: {ssh_descriptor}")
-      break
-
-    print("  SSH not ready yet; sleeping 30s...")
-    time.sleep(30)
-
-  if not ssh_descriptor or ssh_descriptor.lower().startswith("error:"):
-    raise SystemExit(f"Timed out waiting for SSH on instance {instance_id}.")
-
-  # Two possible formats:
-  # 1) URL:  ssh://user@host:port
-  # 2) Full ssh command: ssh -p 4242 -i /path/to/key user@host
-  if ssh_descriptor.startswith("ssh://"):
-    # URL-style from `_ssh_url`
-    rest = ssh_descriptor[len("ssh://") :]
-    try:
-      user_host, port_str = rest.rsplit(":", 1)
-      user, host = user_host.split("@", 1)
-      port = int(port_str)
+      rows = vast.show_instances()
     except Exception as e:
-      raise SystemExit(f"Could not parse ssh-url output into host/user/port: {ssh_descriptor} ({e})")
-    return {
-      "hostname": host,
-      "username": user,
-      "port": port,
-      "key_filename": str(SSH_KEY_PATH),
-    }
+      print(f"  show_instances failed: {e}; retry in 15s...")
+      time.sleep(15)
+      continue
 
-  # Fallback: parse as full ssh command (if Vast ever emits one)
-  tokens = shlex.split(ssh_descriptor)
-  tokens_iter = iter(tokens[1:])  # skip leading "ssh"
-  host = None
-  user = None
-  port = 22
-  key_path: Optional[str] = None
+    for row in (rows or []):
+      if isinstance(row, dict) and int(row.get("id", -1)) == instance_id:
+        inst = row
+        break
 
-  for tok in tokens_iter:
-    if tok == "-p":
-      port = int(next(tokens_iter))
-    elif tok == "-i":
-      key_path = next(tokens_iter)
-    elif "@" in tok:
-      user, host = tok.split("@", 1)
+    if inst is None:
+      print(f"  instance {instance_id} not found in show_instances; retry in 15s...")
+      time.sleep(15)
+      continue
 
-  if not host or not user:
-    raise SystemExit(f"Could not parse ssh-url output into host/user: {ssh_descriptor}")
+    actual = inst.get("actual_status")
+    intended = inst.get("intended_status")
+    if actual == "running":
+      ssh_host = inst.get("ssh_host")
+      ssh_port = inst.get("ssh_port")
+      if ssh_host and ssh_port:
+        print(f"SSH endpoint ready: ssh://root@{ssh_host}:{ssh_port}")
+        return {
+          "hostname": str(ssh_host),
+          "username": "root",
+          "port": int(ssh_port),
+          "key_filename": str(SSH_KEY_PATH),
+        }
+      print(f"  instance running but ssh_host/ssh_port missing; retry in 15s...")
+    else:
+      print(f"  actual={actual} intended={intended}; retry in 15s...")
+    time.sleep(15)
 
-  return {
-    "hostname": host,
-    "username": user,
-    "port": port,
-    "key_filename": key_path or str(SSH_KEY_PATH),
-  }
+  raise SystemExit(
+    f"Timed out waiting for instance {instance_id} actual_status=running "
+    f"(last actual={inst.get('actual_status') if inst else None})."
+  )
 
 
 def run_remote_training(
